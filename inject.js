@@ -44,32 +44,43 @@
     try { localStorage.setItem(CFG.dataKey, JSON.stringify(d)); } catch (e) {}
   }
 
-  // 云端 structure → 本地 software
+  // 云端 structure → 本地 software（支持三级：软件 › 文件夹 › 笔记）
   function toSoftware(sources) {
     const stamp = Date.now();
     return (sources || []).map(function (s, i) {
       const name = String((s && s.name) || '').trim();
+      const folders = ((s && s.folders) || []).map(function (f, j) {
+        const fname = String((typeof f === 'string' ? f : (f && f.name)) || '').trim();
+        const notes = ((typeof f === 'object' && f && f.notes) || []).map(function (n, k) {
+          const nname = String((typeof n === 'string' ? n : (n && n.name)) || '').trim();
+          return { id: 'rs-n-' + i + '-' + j + '-' + k + '-' + stamp, name: nname, recordCount: 0 };
+        }).filter(function (n) { return n.name; });
+        return { id: 'rs-f-' + i + '-' + j + '-' + stamp, name: fname, notes: notes, recordCount: 0 };
+      }).filter(function (f) { return f.name; });
       return {
         id: 'rs-sw-' + i + '-' + stamp,
         name: name,
         icon: (name.charAt(0) || '?').toUpperCase(),
         recordCount: 0,
-        folders: ((s && s.folders) || []).map(function (f, j) {
-          const fname = String((typeof f === 'string' ? f : (f && f.name)) || '').trim();
-          return { id: 'rs-f-' + i + '-' + j + '-' + stamp, name: fname, notes: [], recordCount: 0 };
-        }),
+        folders: folders,
       };
-    });
+    }).filter(function (s) { return s.name; });
   }
 
-  // 本地 software → 云端 structure
+  // 本地 software → 云端 structure（software 原样带上，保证换设备能连笔记一起还原）
   function toStructure(software) {
     return {
+      software: software || [],
       sources: (software || []).map(function (s) {
         return {
           name: s.name,
           type: s.type || '电子',
-          folders: (s.folders || []).map(function (f) { return { name: f.name }; }),
+          folders: (s.folders || []).map(function (f) {
+            return {
+              name: f.name,
+              notes: (f.notes || []).map(function (n) { return { name: n.name }; }),
+            };
+          }),
         };
       }),
     };
@@ -287,9 +298,14 @@
       const d = readData();
       let changed = false;
 
-      const src = m.structure && m.structure.sources;
-      if (Array.isArray(src) && src.length) {
-        d.software = toSoftware(src);
+      const st = m.structure || {};
+      if (Array.isArray(st.software) && st.software.length) {
+        // 完整还原（含笔记层级）
+        d.software = st.software;
+        d.hasOnboarded = true;
+        changed = true;
+      } else if (Array.isArray(st.sources) && st.sources.length) {
+        d.software = toSoftware(st.sources);
         d.hasOnboarded = true;
         changed = true;
       }
@@ -340,23 +356,98 @@
   }
 
   // ---------- 2) AI 引导解析 ----------
+  // 场景化指令：让 AI 明确知道自己「在哪个环境里、要产出什么东西」
+  const EXTRACT_SCENE =
+    '【当前场景】你是「记录空间」这个笔记管理 App 里、新手引导步骤的"结构识别助手"。' +
+    '用户正在用一句自然语言描述：他平时用什么软件／本子记东西、每个载体里有哪些文件夹、文件夹里又放了哪些笔记。\n' +
+    '【你的任务】把这句话解析成三级结构：软件 › 文件夹 › 笔记。\n' +
+    '【只输出 JSON，不要任何解释文字、不要 Markdown、不要代码块围栏】\n' +
+    '格式：{"software":[{"name":"软件名","type":"电子","folders":[{"name":"文件夹名","notes":[{"name":"笔记名"}]}]}]}\n' +
+    '【规则】\n' +
+    '1. 只能使用用户原话里出现过的名称，绝对不许编造。\n' +
+    '2. 用户没提到的层级就给空数组，不要为了凑数加"未分类""其他"这类词。\n' +
+    '3. type 只能是「电子」或「纸质」。\n' +
+    '4. 名称要去掉"我用""用来做""平时会"这类前缀词。\n' +
+    '5. 如果这句话完全没提到任何记录载体，返回 {"software":[]}。\n';
+
+  // 本地兜底解析：AI 完全不可用时也不会毫无反应
+  const KNOWN_APPS = ['notion', 'goodnotes', 'obsidian', '幕布', '印象笔记', 'evernote', 'onenote',
+    '苹果备忘录', '备忘录', '语雀', '飞书文档', 'flomo', '浮墨', 'wolai', '我来', '有道云笔记',
+    'bear', 'craft', 'logseq', 'roam research', '思源', 'siyuan', '腾讯文档', '石墨', 'typora'];
+
+  function localExtract(text) {
+    const out = [];
+    const segs = String(text || '').split(/[；;。\n]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+    segs.forEach(function (seg) {
+      const low = seg.toLowerCase();
+      let name = '';
+      for (let i = 0; i < KNOWN_APPS.length; i++) {
+        const k = KNOWN_APPS[i];
+        const p = low.indexOf(k);
+        if (p >= 0) { name = seg.substr(p, k.length); break; }
+      }
+      if (!name) {
+        const m = seg.match(/(?:用|在|拿|靠)\s*([^\s，,、。；;：:]{2,12}?)(?=来|做|记|写|管理|整理|存|放|笔记)/);
+        if (m) name = m[1];
+      }
+      if (!name) return;
+      let folders = [];
+      const fm = seg.match(/(?:有|包含|分成|分为|里面(?:有)?|下有|分别有)\s*([^。；;]*)/);
+      if (fm) {
+        folders = fm[1].split(/[、,，\/]/).map(function (s) {
+          return s.replace(/[「」“”"'’]/g, '')
+            .replace(/^(?:个|这些|那些|的)/, '')
+            .replace(/(?:文件夹|目录|栏目|分类|两个|三个|若干)$/, '')
+            .trim();
+        }).filter(function (s) { return s && s.length <= 20; });
+      }
+      out.push({
+        name: name,
+        type: /纸|手写|本子/.test(seg) ? '纸质' : '电子',
+        folders: folders.map(function (f) { return { name: f, notes: [] }; }),
+      });
+    });
+    return out;
+  }
+
+  // 返回 { software, via, error }
   async function aiExtract(text) {
-    // 首选专用接口（需要「访问令牌」是主令牌）
+    if (!api.base()) return { software: [], via: 'none', error: 'NO_WORKER' };
+    const token = api.accessToken();
+    if (!token || token.length < 6) return { software: [], via: 'none', error: 'NO_TOKEN' };
+
+    // 路径一：专用接口（只有「访问令牌」正好是主令牌时才能用，最省额度）
     try {
       const r = await api.extract(text);
-      if (r.ok && r.data && Array.isArray(r.data.sources) && r.data.sources.length) return r.data.sources;
-    } catch (e) {}
-    // 退路：借对话接口要一段 JSON
+      if (r.ok && r.data && Array.isArray(r.data.sources) && r.data.sources.length) {
+        return { software: r.data.sources, via: 'extract', error: '' };
+      }
+    } catch (e) { /* 落到路径二 */ }
+
+    // 路径二：对话接口 + 完整场景说明（任意 ≥6 位密码都能走通）
     try {
-      const prompt =
-        '把下面这句话里提到的「记录载体」和「文件夹」抽成 JSON，只输出 JSON，不要任何解释。\n' +
-        '格式：{"sources":[{"name":"载体名","type":"电子","folders":[{"name":"文件夹名"}]}]}\n\n' +
-        '我的话：' + text;
-      const c = await api.chat([{ role: 'user', content: prompt }]);
-      const j = c.ok && c.data ? parseJsonLoose(c.data.reply) : null;
-      if (j && Array.isArray(j.sources) && j.sources.length) return j.sources;
-    } catch (e) {}
-    return null;
+      const c = await api.chat([{ role: 'user', content: EXTRACT_SCENE + '\n用户的话：' + text }]);
+      if (c.ok && c.data) {
+        const j = parseJsonLoose(c.data.reply);
+        const list = j && (j.software || j.sources);
+        if (Array.isArray(list) && list.length) return { software: list, via: 'ai', error: '' };
+      } else if (c.status === 401) {
+        return { software: [], via: 'none', error: 'BAD_TOKEN' };
+      }
+    } catch (e) { /* 落到路径三 */ }
+
+    // 路径三：本地规则兜底
+    const local = localExtract(text);
+    if (local.length) return { software: local, via: 'local', error: '' };
+    return { software: [], via: 'none', error: 'NO_MATCH' };
+  }
+
+  function summarize(software) {
+    let f = 0, n = 0;
+    (software || []).forEach(function (s) {
+      (s.folders || []).forEach(function (x) { f++; n += (x.notes || []).length; });
+    });
+    return software.length + ' 个载体 / ' + f + ' 个文件夹 / ' + n + ' 条笔记';
   }
 
   function setupAIOnboarding() {
@@ -364,36 +455,47 @@
       if (input.dataset.rsAi) return;
       input.dataset.rsAi = '1';
 
+      const IDLE = '✨ 用 AI 识别结构（软件 › 文件夹 › 笔记）';
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'rs-ai-btn';
-      btn.textContent = '✨ 用 AI 识别结构';
+      btn.textContent = IDLE;
 
-      // 插到输入框所在容器后面
       const anchor = input.closest('div') || input;
       if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(btn, anchor.nextSibling);
 
+      let timer = null;
+      function say(msg, backMs) {
+        btn.textContent = msg;
+        if (timer) clearTimeout(timer);
+        if (backMs) timer = setTimeout(function () { btn.textContent = IDLE; btn.disabled = false; }, backMs);
+      }
+
       btn.addEventListener('click', async function () {
         const text = (input.value || '').trim();
-        if (!text) { btn.textContent = '先在框里描述一下你的记录方式'; setTimeout(function () { btn.textContent = '✨ 用 AI 识别结构'; }, 1800); return; }
-        if (!api.base()) { btn.textContent = '需要先在「设置」里填代理 URL'; setTimeout(function () { btn.textContent = '✨ 用 AI 识别结构'; }, 2200); return; }
+        if (!text) { say('先在框里描述一下你的记录方式', 2000); return; }
 
         btn.disabled = true;
         btn.textContent = 'AI 识别中…';
-        const sources = await aiExtract(text);
-        if (!sources) {
-          btn.disabled = false;
-          btn.textContent = '没识别出来，换个说法再试';
-          setTimeout(function () { btn.textContent = '✨ 用 AI 识别结构'; }, 2200);
+        const res = await aiExtract(text);
+
+        if (!res.software.length) {
+          if (res.error === 'NO_WORKER') say('还没配代理 URL：去「设置 → AI 助理接入」', 3500);
+          else if (res.error === 'NO_TOKEN') say('还没填访问令牌：去「设置 → AI 助理接入」', 3500);
+          else if (res.error === 'BAD_TOKEN') say('访问令牌不对，去「设置」检查一下', 3500);
+          else say('没认出结构，说的时候带上软件名和文件夹', 3000);
           return;
         }
+
+        const list = toSoftware(res.software);
         const d = readData();
-        d.software = toSoftware(sources);
+        d.software = list;
         d.hasOnboarded = true;
         writeData(d);
         pushStructure();
-        btn.textContent = '已识别 ' + sources.length + ' 个载体，正在应用…';
-        setTimeout(function () { location.reload(); }, 700);
+        const tag = res.via === 'local' ? '（本地规则，AI 未接入）' : '';
+        say('已识别：' + summarize(list) + tag + '，正在应用…', 0);
+        setTimeout(function () { location.reload(); }, 900);
       });
     });
   }
@@ -469,6 +571,13 @@
   function init() {
     if (window.__rsInjectLoaded) return;
     window.__rsInjectLoaded = true;
+
+    // 调试用：可在控制台直接调 window.__rsInject.aiExtract('我用 Notion…')
+    window.__rsInject = {
+      aiExtract: aiExtract, toSoftware: toSoftware, toStructure: toStructure,
+      localExtract: localExtract, summarize: summarize, readData: readData,
+      pushStructure: pushStructure, pullMemory: pullMemory, api: api,
+    };
 
     injectStyles();
     patchFetch();
