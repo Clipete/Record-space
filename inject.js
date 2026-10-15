@@ -134,7 +134,7 @@
       $$(selector).forEach(function (el) {
         if (seen.has(el)) return;
         seen.add(el);
-        try { cb(el); } catch (e) {}
+        try { cb(el); } catch (e) { console.warn('[RS Inject] 处理元素出错：', e && e.message, el); }
       });
     }
     scan();
