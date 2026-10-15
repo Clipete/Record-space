@@ -67,10 +67,12 @@
     }).filter(function (s) { return s.name; });
   }
 
-  // 本地 software → 云端 structure（software 原样带上，保证换设备能连笔记一起还原）
+  // 本地 software → 云端 structure（software / records 原样带上，保证换设备能完整还原）
   function toStructure(software) {
+    const d = readData();
     return {
       software: software || [],
+      records: d.records || [],
       sources: (software || []).map(function (s) {
         return {
           name: s.name,
@@ -84,6 +86,98 @@
         };
       }),
     };
+  }
+
+  // 合并两套结构：同名软件/文件夹/笔记保留原有的，只补新的，绝不整片覆盖
+  function mergeSoftware(oldList, newList) {
+    const out = (oldList || []).map(function (s) {
+      return Object.assign({}, s, { folders: (s.folders || []).slice() });
+    });
+    (newList || []).forEach(function (ns) {
+      const name = String(ns.name || '').trim();
+      if (!name) return;
+      const idx = out.findIndex(function (s) { return String(s.name || '').trim() === name; });
+      if (idx < 0) { out.push(ns); return; }
+      const cur = out[idx];
+      const folders = (cur.folders || []).slice();
+      (ns.folders || []).forEach(function (nf) {
+        const fname = String(nf.name || '').trim();
+        if (!fname) return;
+        const fi = folders.findIndex(function (f) { return String(f.name || '').trim() === fname; });
+        if (fi < 0) { folders.push(nf); return; }
+        const notes = (folders[fi].notes || []).slice();
+        (nf.notes || []).forEach(function (nn) {
+          const nname = String(nn.name || '').trim();
+          if (!nname) return;
+          if (!notes.some(function (n) { return String(n.name || '').trim() === nname; })) notes.push(nn);
+        });
+        folders[fi] = Object.assign({}, folders[fi], { notes: notes });
+      });
+      out[idx] = Object.assign({}, cur, { folders: folders });
+    });
+    return out;
+  }
+
+  // 合并记录：按 id 去重，本机已有的优先
+  function mergeRecords(local, remote) {
+    const out = (local || []).slice();
+    const ids = {};
+    out.forEach(function (r) { if (r && r.id) ids[r.id] = true; });
+    (remote || []).forEach(function (r) {
+      if (!r) return;
+      if (r.id && ids[r.id]) return;
+      out.push(r);
+      if (r.id) ids[r.id] = true;
+    });
+    return out;
+  }
+
+  // ---------- 本机自动备份 + 空数据自愈 ----------
+  const BACKUP_KEY = 'rs_data_backup';
+  const RESTORE_FLAG = 'rs_restored_once';
+
+  function backupNow() {
+    const d = readData();
+    if ((d.software || []).length || (d.records || []).length) {
+      try { localStorage.setItem(BACKUP_KEY, JSON.stringify({ at: Date.now(), data: d })); } catch (e) {}
+    }
+  }
+
+  function restoreIfWiped() {
+    const d = readData();
+    const emptyNow = !(d.software || []).length && !(d.records || []).length;
+    if (!emptyNow) return false;
+    let used = false;
+    try { used = sessionStorage.getItem(RESTORE_FLAG) === '1'; } catch (e) {}
+    if (used) return false;
+    try {
+      const b = JSON.parse(localStorage.getItem(BACKUP_KEY) || 'null');
+      const bd = b && b.data;
+      if (bd && (((bd.software || []).length) || ((bd.records || []).length))) {
+        writeData(Object.assign({}, bd, { hasOnboarded: true }));
+        try { sessionStorage.setItem(RESTORE_FLAG, '1'); } catch (e) {}
+        console.warn('[RS Inject] 数据意外变空，已从本机备份恢复并刷新');
+        location.reload();
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function setupBackup() {
+    backupNow();
+    setInterval(backupNow, 5000);
+    window.addEventListener('beforeunload', backupNow);
+    // 用户主动「清空所有数据」时，备份也一起清掉，避免被自动救回来
+    onElement('button', function (btn) {
+      const label = (btn.textContent || '').trim();
+      if (label !== '清空所有数据' && label !== '重新配置记录结构') return;
+      if (btn.dataset.rsClear) return;
+      btn.dataset.rsClear = '1';
+      btn.addEventListener('click', function () {
+        try { localStorage.removeItem(BACKUP_KEY); } catch (e) {}
+      }, true);
+    });
   }
 
   function parseJsonLoose(text) {
@@ -299,15 +393,17 @@
       let changed = false;
 
       const st = m.structure || {};
-      if (Array.isArray(st.software) && st.software.length) {
-        // 完整还原（含笔记层级）
-        d.software = st.software;
+      let incoming = [];
+      if (Array.isArray(st.software) && st.software.length) incoming = st.software;
+      else if (Array.isArray(st.sources) && st.sources.length) incoming = toSoftware(st.sources);
+      if (incoming.length) {
+        d.software = mergeSoftware(d.software, incoming);
         d.hasOnboarded = true;
         changed = true;
-      } else if (Array.isArray(st.sources) && st.sources.length) {
-        d.software = toSoftware(st.sources);
-        d.hasOnboarded = true;
-        changed = true;
+      }
+      if (Array.isArray(st.records) && st.records.length) {
+        const mergedR = mergeRecords(d.records, st.records);
+        if (mergedR.length !== (d.records || []).length) { d.records = mergedR; changed = true; }
       }
       if (Array.isArray(m.feedback) && m.feedback.length) {
         d.feedback = m.feedback;
@@ -489,12 +585,15 @@
 
         const list = toSoftware(res.software);
         const d = readData();
-        d.software = list;
+        const before = (d.software || []).length;
+        d.software = mergeSoftware(d.software, list);
         d.hasOnboarded = true;
         writeData(d);
+        backupNow();
         pushStructure();
         const tag = res.via === 'local' ? '（本地规则，AI 未接入）' : '';
-        say('已识别：' + summarize(list) + tag + '，正在应用…', 0);
+        const added = d.software.length - before;
+        say('已识别：' + summarize(list) + tag + (added > 0 ? '，新增 ' + added + ' 个载体' : '，已并入现有结构') + '，正在应用…', 0);
         setTimeout(function () { location.reload(); }, 900);
       });
     });
@@ -572,14 +671,20 @@
     if (window.__rsInjectLoaded) return;
     window.__rsInjectLoaded = true;
 
+    // 数据被意外清空时，先从本机备份救回来（会触发一次刷新）
+    if (restoreIfWiped()) return;
+
     // 调试用：可在控制台直接调 window.__rsInject.aiExtract('我用 Notion…')
     window.__rsInject = {
       aiExtract: aiExtract, toSoftware: toSoftware, toStructure: toStructure,
       localExtract: localExtract, summarize: summarize, readData: readData,
+      mergeSoftware: mergeSoftware, mergeRecords: mergeRecords,
+      backupNow: backupNow, restoreIfWiped: restoreIfWiped,
       pushStructure: pushStructure, pullMemory: pullMemory, api: api,
     };
 
     injectStyles();
+    setupBackup();
     patchFetch();
     setupFeedbackSync();
     setupAIOnboarding();
